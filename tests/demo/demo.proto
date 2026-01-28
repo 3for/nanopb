@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+message Sub {
+  uint32 x = 1;
+  string note = 2;
+}
+
+message Demo {
+  uint32 id = 1;
+  string name = 2;
+  repeated uint32 nums = 3;
+  bytes payload = 4;
+  Sub sub = 5;
+}

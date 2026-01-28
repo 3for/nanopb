@@ -1,0 +1,4 @@
+Demo.name        max_size: 32
+Demo.nums        max_count: 10
+Demo.payload     max_size: 64
+Sub.note         max_size: 32

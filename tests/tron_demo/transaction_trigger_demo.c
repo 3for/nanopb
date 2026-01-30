@@ -222,12 +222,6 @@ static bool encode_raw_payload(pb_ostream_t *stream, void *vctx)
 {
     raw_ctx_t *ctx = (raw_ctx_t *)vctx;
 
-    if (!encode_submessage_tagged(stream,
-                                  protocol_Transaction_raw_contract_tag,
-                                  encode_contract_payload,
-                                  &ctx->contract_ctx))
-        return false;
-
     if (ctx->custom_data_hex != NULL && ctx->custom_data_hex_len > 0U)
     {
         if (!encode_hex_bytes_field(stream,
@@ -236,6 +230,12 @@ static bool encode_raw_payload(pb_ostream_t *stream, void *vctx)
                                     ctx->custom_data_hex_len))
             return false;
     }
+
+    if (!encode_submessage_tagged(stream,
+                                  protocol_Transaction_raw_contract_tag,
+                                  encode_contract_payload,
+                                  &ctx->contract_ctx))
+        return false;
 
     if (!pb_encode_tag(stream, PB_WT_VARINT, protocol_Transaction_raw_fee_limit_tag))
         return false;
@@ -1005,6 +1005,13 @@ typedef struct
     size_t len;
 } bytes_view_t;
 
+typedef struct
+{
+    uint8_t *buf;
+    size_t cap;
+    size_t len;
+} bytes_sink_t;
+
 static bool encode_bytes_cb(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
 {
     const bytes_view_t *view = (const bytes_view_t *)(*arg);
@@ -1013,6 +1020,36 @@ static bool encode_bytes_cb(pb_ostream_t *stream, const pb_field_t *field, void 
     if (!pb_encode_tag_for_field(stream, field))
         return false;
     return pb_encode_string(stream, view->buf, view->len);
+}
+
+static bool decode_bytes_cb(pb_istream_t *stream, const pb_field_t *field, void **arg)
+{
+    (void)field;
+    bytes_sink_t *sink = (bytes_sink_t *)(*arg);
+    if (sink == NULL)
+        return false;
+
+    const size_t total = stream->bytes_left;
+    sink->len = total;
+
+    const size_t to_copy = min_size(total, sink->cap);
+    if (to_copy > 0U)
+    {
+        if (!pb_read(stream, sink->buf, to_copy))
+            return false;
+    }
+
+    size_t remaining = total - to_copy;
+    while (remaining > 0U)
+    {
+        uint8_t scratch[32];
+        const size_t chunk = min_size(remaining, sizeof(scratch));
+        if (!pb_read(stream, scratch, chunk))
+            return false;
+        remaining -= chunk;
+    }
+
+    return true;
 }
 
 static bool hex_to_bytes_standalone(const char *hex, size_t hex_len_chars, uint8_t *out, size_t out_size)
@@ -1262,10 +1299,18 @@ static bool base58check_encode_tron(const uint8_t addr21[21], char *out, size_t 
 int main(void)
 {
     size_t required = 0;
-    const char *custom_text = "This is a test case for extra data";
-    char custom_hex[128];
-    if (!bytes_to_hex_standalone((const uint8_t *)custom_text,
-                                 strlen(custom_text),
+    static const char k_custom_text[] =
+        "In this section of the Developer Portal, you will find the resources to build, test and submit C and Rust apps, "
+        "Ethereum plugins and Cloned coins apps, compatible with all Ledger devices (Ledger Nano S+, Ledger Nano X, Ledger "
+        "Stax and Ledger Flex).This is a test case for extra data.";
+    enum
+    {
+        CUSTOM_TEXT_LEN = (int)(sizeof(k_custom_text) - 1U),
+        CUSTOM_HEX_LEN = (int)(CUSTOM_TEXT_LEN * 2U + 1U)
+    };
+    char custom_hex[CUSTOM_HEX_LEN];
+    if (!bytes_to_hex_standalone((const uint8_t *)k_custom_text,
+                                 (size_t)CUSTOM_TEXT_LEN,
                                  custom_hex,
                                  sizeof(custom_hex)))
     {
@@ -1331,6 +1376,9 @@ int main(void)
     tx_pb.raw_data.contract[0].has_parameter = true;
     tx_pb.raw_data.contract[0].parameter = any_pb;
     tx_pb.raw_data.fee_limit = k_tx_ctx.raw_ctx.fee_limit;
+    bytes_view_t custom_view = {(const uint8_t *)k_custom_text, (size_t)CUSTOM_TEXT_LEN};
+    tx_pb.raw_data.custom_data.funcs.encode = encode_bytes_cb;
+    tx_pb.raw_data.custom_data.arg = &custom_view;
 
     static uint8_t buffer_pb[2048];
     pb_ostream_t tx_stream_pb = pb_ostream_from_buffer(buffer_pb, sizeof(buffer_pb));
@@ -1437,6 +1485,219 @@ int main(void)
         }
         printf("\n");
     }
+
+    /* Compare streaming decode output with original inputs. */
+    {
+        bool match_all = true;
+        const size_t expected_data_len = sizeof(call_data_bytes);
+        const size_t expected_custom_len = (size_t)CUSTOM_TEXT_LEN;
+        const size_t expected_data_prefix_len = min_size(expected_data_len, sizeof(res.data_prefix));
+        const size_t expected_custom_prefix_len = min_size(expected_custom_len, sizeof(res.custom_data_prefix));
+
+        if (!res.has_contract_type || res.contract_type != k_tx_ctx.raw_ctx.contract_ctx.type)
+        {
+            printf("compare: contract_type mismatch\n");
+            match_all = false;
+        }
+        if (!res.has_fee_limit || res.fee_limit != k_tx_ctx.raw_ctx.fee_limit)
+        {
+            printf("compare: fee_limit mismatch\n");
+            match_all = false;
+        }
+        if (res.has_call_value && res.call_value != 0)
+        {
+            printf("compare: call_value mismatch\n");
+            match_all = false;
+        }
+        if (res.has_call_token_value)
+        {
+            printf("compare: call_token_value should be absent\n");
+            match_all = false;
+        }
+        if (res.has_token_id)
+        {
+            printf("compare: token_id should be absent\n");
+            match_all = false;
+        }
+        if (!res.has_owner_address || res.owner_address_len != sizeof(k_owner_address) ||
+            memcmp(res.owner_address, k_owner_address, sizeof(k_owner_address)) != 0)
+        {
+            printf("compare: owner_address mismatch\n");
+            match_all = false;
+        }
+        if (!res.has_contract_address || res.contract_address_len != sizeof(k_contract_address) ||
+            memcmp(res.contract_address, k_contract_address, sizeof(k_contract_address)) != 0)
+        {
+            printf("compare: contract_address mismatch\n");
+            match_all = false;
+        }
+        if (!res.has_data || res.data_len != expected_data_len ||
+            res.data_prefix_len != expected_data_prefix_len ||
+            memcmp(res.data_prefix, call_data_bytes, res.data_prefix_len) != 0)
+        {
+            printf("compare: data mismatch\n");
+            match_all = false;
+        }
+        if (!res.has_custom_data || res.custom_data_len != expected_custom_len ||
+            res.custom_data_prefix_len != expected_custom_prefix_len ||
+            memcmp(res.custom_data_prefix, k_custom_text, res.custom_data_prefix_len) != 0)
+        {
+            printf("compare: custom_data mismatch\n");
+            match_all = false;
+        }
+
+        printf("streaming decode compare: %s\n", match_all ? "MATCH" : "DIFF");
+    }
+
+    /* Compare streaming decode output with pb_decode output. */
+    {
+        bool match_all = true;
+        static uint8_t any_value_buf[4096];
+        uint8_t custom_buf[CUSTOM_TEXT_LEN];
+
+        bytes_sink_t custom_sink = {custom_buf, sizeof(custom_buf), 0};
+        bytes_sink_t any_value_sink = {any_value_buf, sizeof(any_value_buf), 0};
+
+        protocol_Transaction tx_dec = protocol_Transaction_init_zero;
+        tx_dec.raw_data.custom_data.funcs.decode = decode_bytes_cb;
+        tx_dec.raw_data.custom_data.arg = &custom_sink;
+        tx_dec.raw_data.contract[0].parameter.value.funcs.decode = decode_bytes_cb;
+        tx_dec.raw_data.contract[0].parameter.value.arg = &any_value_sink;
+
+        pb_istream_t tx_in = pb_istream_from_buffer(buffer, out_len);
+        if (!pb_decode(&tx_in, protocol_Transaction_fields, &tx_dec))
+        {
+            printf("pb_decode(Transaction) failed: %s\n", PB_GET_ERROR(&tx_in));
+            return 1;
+        }
+
+        protocol_TriggerSmartContract trigger_dec = protocol_TriggerSmartContract_init_zero;
+        bytes_sink_t data_sink = {call_data_bytes, sizeof(call_data_bytes), 0};
+        trigger_dec.data.funcs.decode = decode_bytes_cb;
+        trigger_dec.data.arg = &data_sink;
+
+        pb_istream_t trigger_in = pb_istream_from_buffer(any_value_sink.buf, any_value_sink.len);
+        if (!pb_decode(&trigger_in, protocol_TriggerSmartContract_fields, &trigger_dec))
+        {
+            printf("pb_decode(TriggerSmartContract) failed: %s\n", PB_GET_ERROR(&trigger_in));
+            return 1;
+        }
+
+        if (!tx_dec.has_raw_data)
+        {
+            printf("pb_decode: missing raw_data\n");
+            match_all = false;
+        }
+        if (tx_dec.raw_data.contract_count < 1)
+        {
+            printf("pb_decode: missing contract\n");
+            match_all = false;
+        }
+        else if (res.has_contract_type && tx_dec.raw_data.contract[0].type != res.contract_type)
+        {
+            printf("pb_decode: contract_type mismatch\n");
+            match_all = false;
+        }
+
+        if (res.has_fee_limit && tx_dec.raw_data.fee_limit != res.fee_limit)
+        {
+            printf("pb_decode: fee_limit mismatch\n");
+            match_all = false;
+        }
+
+        if (res.has_call_value)
+        {
+            if (trigger_dec.call_value != res.call_value)
+            {
+                printf("pb_decode: call_value mismatch\n");
+                match_all = false;
+            }
+        }
+        else if (trigger_dec.call_value != 0)
+        {
+            printf("pb_decode: call_value should be absent\n");
+            match_all = false;
+        }
+
+        if (res.has_call_token_value)
+        {
+            if (trigger_dec.call_token_value != res.call_token_value)
+            {
+                printf("pb_decode: call_token_value mismatch\n");
+                match_all = false;
+            }
+        }
+        else if (trigger_dec.call_token_value != 0)
+        {
+            printf("pb_decode: call_token_value should be absent\n");
+            match_all = false;
+        }
+
+        if (res.has_token_id)
+        {
+            if (trigger_dec.token_id != res.token_id)
+            {
+                printf("pb_decode: token_id mismatch\n");
+                match_all = false;
+            }
+        }
+        else if (trigger_dec.token_id != 0)
+        {
+            printf("pb_decode: token_id should be absent\n");
+            match_all = false;
+        }
+
+        if (res.has_owner_address &&
+            memcmp(res.owner_address, trigger_dec.owner_address, res.owner_address_len) != 0)
+        {
+            printf("pb_decode: owner_address mismatch\n");
+            match_all = false;
+        }
+
+        if (res.has_contract_address &&
+            memcmp(res.contract_address, trigger_dec.contract_address, res.contract_address_len) != 0)
+        {
+            printf("pb_decode: contract_address mismatch\n");
+            match_all = false;
+        }
+
+        if (res.has_data)
+        {
+            const size_t expected_prefix = min_size(data_sink.len, sizeof(res.data_prefix));
+            if (res.data_len != data_sink.len ||
+                res.data_prefix_len != expected_prefix ||
+                memcmp(res.data_prefix, data_sink.buf, res.data_prefix_len) != 0)
+            {
+                printf("pb_decode: data mismatch\n");
+                match_all = false;
+            }
+        }
+        else if (data_sink.len != 0)
+        {
+            printf("pb_decode: data should be absent\n");
+            match_all = false;
+        }
+
+        if (res.has_custom_data)
+        {
+            const size_t expected_prefix = min_size(custom_sink.len, sizeof(res.custom_data_prefix));
+            if (res.custom_data_len != custom_sink.len ||
+                res.custom_data_prefix_len != expected_prefix ||
+                memcmp(res.custom_data_prefix, custom_sink.buf, res.custom_data_prefix_len) != 0)
+            {
+                printf("pb_decode: custom_data mismatch\n");
+                match_all = false;
+            }
+        }
+        else if (custom_sink.len != 0)
+        {
+            printf("pb_decode: custom_data should be absent\n");
+            match_all = false;
+        }
+
+        printf("streaming decode vs pb_decode: %s\n", match_all ? "MATCH" : "DIFF");
+    }
+
     return 0;
 }
 #endif
